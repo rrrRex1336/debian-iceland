@@ -1,0 +1,652 @@
+# ============================================================================
+# Debian rootfs + kernel for OnePlus Pad 3 Pro (OPD2513) / Pad 4 (OPD2514)
+# iceland / SM8850 (kaanapali)
+# ============================================================================
+
+name: Build Debian
+
+on:
+  workflow_dispatch:
+    inputs:
+      distro_suite:
+        description: 'Debian version'
+        type: choice
+        options: [trixie, forky]
+        default: trixie
+
+      desktop:
+        description: 'Desktop environment (server = no desktop)'
+        type: choice
+        options: [KDE Plasma, GNOME, server]
+        default: KDE Plasma
+
+      plasma_mobile:
+        description: 'Install plasma-mobile instead of plasma-desktop'
+        type: boolean
+        default: false
+
+      autologin:
+        description: 'Log the user in automatically'
+        type: boolean
+        default: true
+
+      username:
+        description: 'User name'
+        type: string
+        default: user
+
+      hostname:
+        description: 'Hostname'
+        type: string
+        default: iceland
+
+      language:
+        description: 'System language'
+        type: choice
+        options:
+          - 'None (C.UTF-8)'
+          - 'zh_CN.UTF-8'
+          - 'en_US.UTF-8'
+          - 'zh_TW.UTF-8'
+          - 'ja_JP.UTF-8'
+          - 'ko_KR.UTF-8'
+          - 'de_DE.UTF-8'
+          - 'fr_FR.UTF-8'
+          - 'es_ES.UTF-8'
+          - 'ru_RU.UTF-8'
+        default: 'zh_CN.UTF-8'
+
+      boot_mode:
+        description: |
+          Rootfs partition:
+          - dual (linux):     a dedicated "linux" partition (dual boot)
+          - single (userdata): the whole userdata partition
+          - custom:           a custom partition name
+        type: choice
+        options:
+          - 'dual (linux)'
+          - 'single (userdata)'
+          - 'custom'
+        default: 'dual (linux)'
+
+      custom_partition:
+        description: 'Partition name (only for boot_mode = custom)'
+        type: string
+        default: ''
+
+      boot_method:
+        description: |
+          Boot artefacts:
+          - android_boot: boot.img (Android header v2: kernel + dtb + initramfs)
+          - uefi_esp:     ESP image for U-Boot / EDK2 (kernel + dtb + initramfs)
+          - none:         rootfs and kernel package only
+        type: choice
+        options: [android_boot, uefi_esp, none]
+        default: android_boot
+
+      quiet_boot:
+        description: 'Quiet boot with Plymouth splash'
+        type: boolean
+        default: true
+
+      kernel_repo:
+        description: 'Kernel repository'
+        type: string
+        default: 'https://github.com/map220v/sm8850-mainline'
+
+      kernel_branch:
+        description: 'Kernel branch'
+        type: string
+        default: 'iceland-7.3'
+
+      kernel_config:
+        description: 'Kernel config (path inside the kernel repo)'
+        type: string
+        default: 'arch/arm64/configs/sm8850.config'
+
+      kernel_fragment:
+        description: 'Extra config fragment (path in this repo, empty to skip)'
+        type: string
+        default: 'config/debian-iceland.fragment'
+
+      dtb:
+        description: 'Device tree blob to ship'
+        type: string
+        default: 'kaanapali-oneplus-iceland.dtb'
+
+      firmware_repo:
+        description: 'Firmware repository (downloaded at build time)'
+        type: string
+        default: 'https://github.com/map220v/iceland-firmware'
+
+      firmware_branch:
+        description: 'Firmware branch'
+        type: string
+        default: 'master'
+
+      image_size:
+        description: 'rootfs.img size (e.g. 10G, 12G)'
+        type: string
+        default: '12G'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: "Build rootfs + kernel"
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 360
+
+    permissions:
+      contents: read
+
+    env:
+      ROOTFS_MOUNT: /mnt/rootfs
+      KERNEL_DIR: ${{ github.workspace }}/linux
+      KERNEL_PKG: ${{ github.workspace }}/kernel-pkg
+
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v4
+
+      - name: "Verify arguments"
+        env:
+          ROOTFS_PASSWORD: ${{ secrets.ROOTFS_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${ROOTFS_PASSWORD:-}" ]]; then
+            echo "::warning::ROOTFS_PASSWORD is not set, the default password 'password' will be used."
+          fi
+          if [[ "${{ inputs.boot_mode }}" == "custom" && -z "${{ inputs.custom_partition }}" ]]; then
+            echo "::error::custom_partition is required when boot_mode = custom"
+            exit 1
+          fi
+          echo "✓ Arguments checked"
+
+      - name: "Resolve partition and cmdline"
+        id: part
+        run: |
+          set -euo pipefail
+          case "${{ inputs.boot_mode }}" in
+            'single (userdata)') LABEL=userdata ;;
+            'dual (linux)')      LABEL=linux ;;
+            'custom')            LABEL="${{ inputs.custom_partition }}" ;;
+            *) echo "::error::unknown boot_mode"; exit 1 ;;
+          esac
+          CMDLINE="root=PARTLABEL=$LABEL rw rootwait console=ttyMSM0,115200n8"
+          if [[ "${{ inputs.quiet_boot }}" == "true" && "${{ inputs.desktop }}" != "server" ]]; then
+            CMDLINE="$CMDLINE quiet splash plymouth.ignore-serial-consoles fbcon=map:1"
+          fi
+          echo "label=$LABEL" >> "$GITHUB_OUTPUT"
+          echo "cmdline=$CMDLINE" >> "$GITHUB_OUTPUT"
+          echo "✓ root=PARTLABEL=$LABEL"
+
+      - name: "Install build tools"
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison ccache clang cpio curl debootstrap dosfstools \
+            flex git kmod libelf-dev libssl-dev lld llvm mtools \
+            python3 xz-utils zstd
+          echo "✓ Build tools installed"
+
+      # ------------------------------------------------------------------
+      # Kernel
+      # ------------------------------------------------------------------
+
+      - name: "Clone kernel"
+        run: |
+          set -euo pipefail
+          git clone --depth 1 \
+            --branch "${{ inputs.kernel_branch }}" \
+            "${{ inputs.kernel_repo }}" \
+            "$KERNEL_DIR"
+          echo "✓ $(git -C "$KERNEL_DIR" log --oneline -1)"
+
+      - name: "Configure kernel"
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_DIR"
+          cp "${{ inputs.kernel_config }}" .config
+
+          if [[ -n "${{ inputs.kernel_fragment }}" ]]; then
+            scripts/kconfig/merge_config.sh -m \
+              .config "${{ github.workspace }}/${{ inputs.kernel_fragment }}"
+          fi
+          make ARCH=arm64 LLVM=1 olddefconfig
+          echo "✓ $(grep -cE '^CONFIG_.*=y' .config) options enabled"
+
+      - name: "Build kernel"
+        id: kernel
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_DIR"
+          make -j"$(nproc)" ARCH=arm64 LLVM=1 Image.gz
+          make -j"$(nproc)" ARCH=arm64 LLVM=1 "qcom/${{ inputs.dtb }}"
+          KVER="$(make -s ARCH=arm64 kernelrelease)"
+          echo "kernel_version=$KVER" >> "$GITHUB_OUTPUT"
+          echo "✓ kernel $KVER built"
+
+      - name: "Package kernel"
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_DIR"
+          KVER="${{ steps.kernel.outputs.kernel_version }}"
+          DTB="arch/arm64/boot/dts/qcom/${{ inputs.dtb }}"
+
+          mkdir -p "$KERNEL_PKG/DEBIAN" "$KERNEL_PKG/boot" "$KERNEL_PKG/lib/modules"
+          make -j"$(nproc)" ARCH=arm64 LLVM=1 \
+            INSTALL_MOD_PATH="$KERNEL_PKG" modules_install
+          rm -f "$KERNEL_PKG/lib/modules/$KVER/build" \
+                "$KERNEL_PKG/lib/modules/$KVER/source"
+
+          install -Dm644 arch/arm64/boot/Image    "$KERNEL_PKG/boot/Image-$KVER"
+          install -Dm644 arch/arm64/boot/Image.gz "$KERNEL_PKG/boot/Image.gz"
+          install -Dm644 "$DTB"                   "$KERNEL_PKG/boot/$(basename "$DTB")"
+          install -Dm644 .config                  "$KERNEL_PKG/boot/config-$KVER"
+          install -Dm644 System.map               "$KERNEL_PKG/boot/System.map-$KVER"
+
+          cat > "$KERNEL_PKG/DEBIAN/control" <<EOF
+          Package: linux-iceland
+          Version: ${KVER}-1
+          Architecture: arm64
+          Maintainer: iceland mainline <noreply@github.com>
+          Section: kernel
+          Priority: optional
+          Description: Mainline kernel for OnePlus Pad 3 Pro / Pad 4 (iceland, SM8850)
+          EOF
+
+          {
+            echo '#!/bin/sh'
+            echo 'set -e'
+            echo "depmod -a $KVER || true"
+            echo 'if command -v update-initramfs >/dev/null 2>&1; then'
+            echo "  update-initramfs -u -k $KVER || true"
+            echo 'fi'
+            echo 'exit 0'
+          } > "$KERNEL_PKG/DEBIAN/postinst"
+          chmod 0755 "$KERNEL_PKG/DEBIAN/postinst"
+
+          cd "$(dirname "$KERNEL_PKG")"
+          dpkg-deb --build --root-owner-group "$(basename "$KERNEL_PKG")" linux-iceland.deb
+          echo "✓ linux-iceland.deb ($(du -h linux-iceland.deb | cut -f1))"
+
+      # ------------------------------------------------------------------
+      # Firmware (downloaded automatically)
+      # ------------------------------------------------------------------
+
+      - name: "Package firmware"
+        run: |
+          set -euo pipefail
+          git clone --depth 1 \
+            --branch "${{ inputs.firmware_branch }}" \
+            "${{ inputs.firmware_repo }}" \
+            firmware-src
+          mkdir -p firmware-pkg/DEBIAN firmware-pkg/usr/lib/firmware
+          cp -a firmware-src/. firmware-pkg/usr/lib/firmware/
+          rm -rf firmware-pkg/usr/lib/firmware/.git
+
+          cat > firmware-pkg/DEBIAN/control <<'EOF'
+          Package: firmware-iceland
+          Version: 1.0
+          Architecture: all
+          Maintainer: iceland mainline <noreply@github.com>
+          Section: non-free-firmware
+          Priority: optional
+          Description: Firmware for OnePlus Pad 3 Pro / Pad 4 (iceland, SM8850)
+          EOF
+
+          dpkg-deb --build --root-owner-group firmware-pkg firmware-iceland.deb
+          echo "✓ firmware-iceland.deb ($(du -h firmware-iceland.deb | cut -f1))"
+
+      # ------------------------------------------------------------------
+      # Rootfs image
+      # ------------------------------------------------------------------
+
+      - name: "Create rootfs image"
+        run: |
+          set -euo pipefail
+          truncate -s "${{ inputs.image_size }}" rootfs.img
+          mkfs.ext4 -q -L iceland-root rootfs.img
+          echo "✓ rootfs.img (${{ inputs.image_size }})"
+
+      - name: "Mount rootfs"
+        run: |
+          set -euo pipefail
+          sudo mkdir -p "$ROOTFS_MOUNT"
+          sudo mount -o loop rootfs.img "$ROOTFS_MOUNT"
+
+      - name: "Debootstrap"
+        run: |
+          set -euo pipefail
+          sudo debootstrap \
+            --arch=arm64 \
+            --components=main,contrib,non-free-firmware \
+            "${{ inputs.distro_suite }}" \
+            "$ROOTFS_MOUNT" \
+            http://deb.debian.org/debian/
+          echo "✓ debootstrap done"
+
+      - name: "Mount virtual filesystems"
+        run: |
+          set -euo pipefail
+          sudo mount --bind /dev "$ROOTFS_MOUNT/dev"
+          sudo mount --bind /dev/pts "$ROOTFS_MOUNT/dev/pts"
+          sudo mount -t proc proc "$ROOTFS_MOUNT/proc"
+          sudo mount -t sysfs sys "$ROOTFS_MOUNT/sys"
+          sudo cp /etc/resolv.conf "$ROOTFS_MOUNT/etc/resolv.conf"
+
+      - name: "Install base packages"
+        run: |
+          set -euo pipefail
+          sudo chroot "$ROOTFS_MOUNT" apt-get update
+          sudo chroot "$ROOTFS_MOUNT" env DEBIAN_FRONTEND=noninteractive \
+            apt-get install -y --no-install-recommends \
+              systemd systemd-sysv initramfs-tools kmod \
+              sudo vim wget curl ca-certificates \
+              network-manager openssh-server wpasupplicant iw \
+              dbus chrony lm-sensors wireless-regdb \
+              net-tools iproute2 iputils-ping \
+              zstd xz-utils \
+              libglib2.0-0 libqmi-glib5 libmbim-glib4 libyaml-0-2 \
+              libgudev-1.0-0 libpolkit-gobject-1-0
+          echo "✓ base packages installed"
+
+      - name: "Install kernel and firmware"
+        run: |
+          set -euo pipefail
+          sudo cp linux-iceland.deb firmware-iceland.deb "$ROOTFS_MOUNT/tmp/"
+          sudo chroot "$ROOTFS_MOUNT" bash -c '
+            set -e
+            dpkg -i /tmp/firmware-iceland.deb
+            dpkg -i /tmp/linux-iceland.deb || apt-get install -f -y
+            rm -f /tmp/*.deb
+          '
+          echo "✓ kernel and firmware installed"
+
+      # ------------------------------------------------------------------
+      # System configuration
+      # ------------------------------------------------------------------
+
+      - name: "Configure hostname and locale"
+        run: |
+          set -euo pipefail
+          echo "${{ inputs.hostname }}" | sudo tee "$ROOTFS_MOUNT/etc/hostname" >/dev/null
+          grep -q "${{ inputs.hostname }}" "$ROOTFS_MOUNT/etc/hosts" || \
+            echo "127.0.1.1 ${{ inputs.hostname }}" | sudo tee -a "$ROOTFS_MOUNT/etc/hosts" >/dev/null
+
+          LANG_CHOICE="${{ inputs.language }}"
+          if [[ "$LANG_CHOICE" != "None (C.UTF-8)" ]]; then
+            sudo chroot "$ROOTFS_MOUNT" apt-get install -y locales
+            sudo sed -i 's/^# *\(en_US\.UTF-8\)/\1/' "$ROOTFS_MOUNT/etc/locale.gen"
+            sudo sed -i "s/^# *\\(${LANG_CHOICE//./\\.}\\)/\\1/" "$ROOTFS_MOUNT/etc/locale.gen"
+            sudo chroot "$ROOTFS_MOUNT" locale-gen
+            echo "LANG=$LANG_CHOICE" | sudo tee "$ROOTFS_MOUNT/etc/default/locale" >/dev/null
+          fi
+          echo "✓ hostname/locale set"
+
+      - name: "Create user"
+        env:
+          ROOTFS_PASSWORD: ${{ secrets.ROOTFS_PASSWORD }}
+        run: |
+          set -euo pipefail
+          sudo chroot "$ROOTFS_MOUNT" useradd -m -s /bin/bash -G sudo "${{ inputs.username }}"
+          PASSWORD="${ROOTFS_PASSWORD:-password}"
+          echo "::add-mask::$PASSWORD"
+          printf '%s:%s\n' "${{ inputs.username }}" "$PASSWORD" | sudo chroot "$ROOTFS_MOUNT" chpasswd
+          printf 'root:%s\n' "$PASSWORD" | sudo chroot "$ROOTFS_MOUNT" chpasswd
+          echo "✓ user ${{ inputs.username }} created"
+
+      # ------------------------------------------------------------------
+      # Desktop
+      # ------------------------------------------------------------------
+
+      - name: "Install GNOME"
+        if: ${{ inputs.desktop == 'GNOME' }}
+        run: |
+          set -euo pipefail
+          sudo chroot "$ROOTFS_MOUNT" env DEBIAN_FRONTEND=noninteractive \
+            apt-get install -y \
+              gnome-shell gnome-session gnome-terminal gnome-control-center \
+              gdm3 firefox-esr
+          echo "✓ GNOME installed"
+
+      - name: "Install KDE Plasma"
+        if: ${{ inputs.desktop == 'KDE Plasma' }}
+        run: |
+          set -euo pipefail
+          if [[ "${{ inputs.plasma_mobile }}" == "true" ]]; then
+            PLASMA_PACKAGE=plasma-mobile
+          else
+            PLASMA_PACKAGE=plasma-desktop
+          fi
+          sudo chroot "$ROOTFS_MOUNT" env DEBIAN_FRONTEND=noninteractive \
+            apt-get install -y \
+              "$PLASMA_PACKAGE" plasma-workspace plasma-nm \
+              sddm konsole firefox-esr dolphin kate pipewire-alsa
+          echo "✓ KDE Plasma installed"
+
+      - name: "Configure display manager"
+        if: ${{ inputs.desktop != 'server' }}
+        run: |
+          set -euo pipefail
+          if [[ "${{ inputs.desktop }}" == "GNOME" ]]; then
+            DM=gdm3
+          else
+            DM=sddm
+          fi
+          sudo chroot "$ROOTFS_MOUNT" systemctl enable "$DM"
+          sudo chroot "$ROOTFS_MOUNT" systemctl set-default graphical.target
+
+          if [[ "${{ inputs.autologin }}" == "true" ]]; then
+            if [[ "$DM" == "gdm3" ]]; then
+              sudo mkdir -p "$ROOTFS_MOUNT/etc/gdm3"
+              printf '[daemon]\nAutomaticLoginEnable=true\nAutomaticLogin=%s\n' \
+                "${{ inputs.username }}" | sudo tee "$ROOTFS_MOUNT/etc/gdm3/daemon.conf" >/dev/null
+            else
+              if [[ "${{ inputs.plasma_mobile }}" == "true" ]]; then
+                SESSION=plasma-mobile
+              else
+                SESSION=plasma
+              fi
+              sudo mkdir -p "$ROOTFS_MOUNT/etc/sddm.conf.d"
+              printf '[Autologin]\nUser=%s\nSession=%s\n' \
+                "${{ inputs.username }}" "$SESSION" | \
+                sudo tee "$ROOTFS_MOUNT/etc/sddm.conf.d/autologin.conf" >/dev/null
+            fi
+          fi
+          echo "✓ $DM configured"
+
+      - name: "Install Plymouth"
+        if: ${{ inputs.quiet_boot && inputs.desktop != 'server' }}
+        run: |
+          set -euo pipefail
+          sudo chroot "$ROOTFS_MOUNT" env DEBIAN_FRONTEND=noninteractive \
+            apt-get install -y plymouth plymouth-themes
+
+      - name: "Install systemd-boot"
+        if: ${{ inputs.boot_method == 'uefi_esp' }}
+        run: |
+          set -euo pipefail
+          sudo chroot "$ROOTFS_MOUNT" env DEBIAN_FRONTEND=noninteractive \
+            apt-get install -y systemd-boot-efi
+
+      - name: "Enable NetworkManager"
+        run: |
+          set -euo pipefail
+          sudo chroot "$ROOTFS_MOUNT" systemctl enable NetworkManager
+
+      # ------------------------------------------------------------------
+      # Finalise the rootfs
+      # ------------------------------------------------------------------
+
+      - name: "Configure fstab"
+        run: |
+          set -euo pipefail
+          printf 'PARTLABEL=%s / ext4 defaults,x-systemd.growfs 0 1\n' \
+            "${{ steps.part.outputs.label }}" | \
+            sudo tee "$ROOTFS_MOUNT/etc/fstab" >/dev/null
+          echo "✓ fstab written"
+
+      - name: "Build initramfs"
+        run: |
+          set -euo pipefail
+          KVER="${{ steps.kernel.outputs.kernel_version }}"
+          sudo chroot "$ROOTFS_MOUNT" update-initramfs -c -k "$KVER"
+          sudo cp "$ROOTFS_MOUNT/boot/initrd.img-$KVER" "initrd.img-$KVER"
+          sudo cp "$ROOTFS_MOUNT/boot/Image-$KVER"       Image
+          sudo cp "$ROOTFS_MOUNT/boot/Image.gz"          Image.gz
+          echo "✓ initramfs $(du -h "initrd.img-$KVER" | cut -f1)"
+
+      - name: "Clean up"
+        run: |
+          set -euo pipefail
+          sudo chroot "$ROOTFS_MOUNT" apt-get clean
+          sudo rm -f "$ROOTFS_MOUNT/etc/resolv.conf"
+
+      - name: "Unmount rootfs"
+        if: always()
+        run: |
+          set -euo pipefail
+          for m in dev/pts dev proc sys; do
+            sudo umount "$ROOTFS_MOUNT/$m" 2>/dev/null || true
+          done
+          sudo umount "$ROOTFS_MOUNT" 2>/dev/null || true
+
+      - name: "Finalise image"
+        run: |
+          set -euo pipefail
+          tune2fs -U random rootfs.img >/dev/null
+          echo "✓ rootfs.img finalised"
+
+      # ------------------------------------------------------------------
+      # Boot artefacts
+      # ------------------------------------------------------------------
+
+      - name: "Build boot.img (Android header v2)"
+        if: ${{ inputs.boot_method == 'android_boot' }}
+        run: |
+          set -euo pipefail
+          KVER="${{ steps.kernel.outputs.kernel_version }}"
+          chmod +x scripts/mkbootimg
+          python3 scripts/mkbootimg \
+            --kernel Image.gz \
+            --dtb "$KERNEL_DIR/arch/arm64/boot/dts/qcom/${{ inputs.dtb }}" \
+            --ramdisk "initrd.img-$KVER" \
+            --cmdline "${{ steps.part.outputs.cmdline }}" \
+            --base 0x00000000 \
+            --kernel_offset 0x00008000 \
+            --ramdisk_offset 0x01000000 \
+            --tags_offset 0x01e00000 \
+            --pagesize 4096 \
+            --header_version 2 \
+            -o boot.img
+          echo "✓ boot.img ($(du -h boot.img | cut -f1))"
+
+      - name: "Build ESP image (UEFI / U-Boot)"
+        if: ${{ inputs.boot_method == 'uefi_esp' }}
+        run: |
+          set -euo pipefail
+          KVER="${{ steps.kernel.outputs.kernel_version }}"
+          DTB_SRC="$KERNEL_DIR/arch/arm64/boot/dts/qcom/${{ inputs.dtb }}"
+
+          dd if=/dev/zero of=esp.img bs=1M count=512 status=none
+          mformat -i esp.img -F ::
+          mmd -i esp.img ::/EFI ::/EFI/BOOT ::/loader ::/loader/entries ::/iceland ::/extlinux
+
+          mcopy -i esp.img Image ::/iceland/Image
+          mcopy -i esp.img "initrd.img-$KVER" ::/iceland/initrd.img
+          mcopy -i esp.img "$DTB_SRC" ::/iceland/iceland.dtb
+
+          cat > extlinux.conf <<EOF
+          DEFAULT debian
+          TIMEOUT 30
+          LABEL debian
+              MENU LABEL Debian (iceland)
+              LINUX /iceland/Image
+              FDT /iceland/iceland.dtb
+              INITRD /iceland/initrd.img
+              APPEND ${{ steps.part.outputs.cmdline }}
+          EOF
+          mcopy -i esp.img extlinux.conf ::/extlinux/extlinux.conf
+
+          cat > iceland.conf <<EOF
+          title   Debian (iceland)
+          linux   /iceland/Image
+          devicetree /iceland/iceland.dtb
+          initrd  /iceland/initrd.img
+          options ${{ steps.part.outputs.cmdline }}
+          EOF
+          mcopy -i esp.img iceland.conf ::/loader/entries/iceland.conf
+          printf 'default iceland\ntimeout 3\n' > loader.conf
+          mcopy -i esp.img loader.conf ::/loader/loader.conf
+
+          sudo mkdir -p "$ROOTFS_MOUNT"
+          sudo mount -o loop,ro rootfs.img "$ROOTFS_MOUNT"
+          if [[ -f "$ROOTFS_MOUNT/usr/lib/systemd/boot/efi/systemd-bootaa64.efi" ]]; then
+            sudo cp "$ROOTFS_MOUNT/usr/lib/systemd/boot/efi/systemd-bootaa64.efi" systemd-bootaa64.efi
+            mcopy -i esp.img systemd-bootaa64.efi ::/EFI/BOOT/BOOTAA64.EFI
+            echo "  systemd-boot included"
+          else
+            echo "::warning::systemd-boot-efi missing, ESP has no EFI/BOOT/BOOTAA64.EFI"
+          fi
+          sudo umount "$ROOTFS_MOUNT"
+          echo "✓ esp.img ($(du -h esp.img | cut -f1))"
+
+      # ------------------------------------------------------------------
+      # Artifacts
+      # ------------------------------------------------------------------
+
+      - name: "Upload rootfs"
+        uses: actions/upload-artifact@v4
+        with:
+          name: rootfs-${{ inputs.distro_suite }}-${{ inputs.desktop }}-${{ steps.part.outputs.label }}
+          path: rootfs.img
+          compression-level: 1
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: "Upload boot image"
+        if: ${{ inputs.boot_method == 'android_boot' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-${{ inputs.distro_suite }}-${{ inputs.desktop }}-${{ steps.part.outputs.label }}
+          path: boot.img
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: "Upload ESP image"
+        if: ${{ inputs.boot_method == 'uefi_esp' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp-${{ inputs.distro_suite }}-${{ inputs.desktop }}-${{ steps.part.outputs.label }}
+          path: esp.img
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: "Upload kernel packages"
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-${{ steps.kernel.outputs.kernel_version }}
+          path: |
+            linux-iceland.deb
+            firmware-iceland.deb
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: "Summary"
+        run: |
+          {
+            echo "### Debian for iceland (SM8850)"
+            echo ""
+            echo "| Item | Value |"
+            echo "| --- | --- |"
+            echo "| Suite | ${{ inputs.distro_suite }} |"
+            echo "| Desktop | ${{ inputs.desktop }} |"
+            echo "| Rootfs partition | ${{ steps.part.outputs.label }} |"
+            echo "| Boot method | ${{ inputs.boot_method }} |"
+            echo "| Kernel | ${{ steps.kernel.outputs.kernel_version }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
